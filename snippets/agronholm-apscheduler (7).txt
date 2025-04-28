@@ -1,0 +1,194 @@
+Directory structure:
+└── executors/
+    ├── __init__.py
+    ├── async_.py
+    ├── qt.py
+    ├── subprocess.py
+    └── thread.py
+
+================================================
+FILE: src/apscheduler/executors/__init__.py
+================================================
+
+
+
+================================================
+FILE: src/apscheduler/executors/async_.py
+================================================
+from __future__ import annotations
+
+from collections.abc import Callable
+from inspect import isawaitable
+from typing import Any
+
+from .._structures import Job
+from ..abc import JobExecutor
+
+
+class AsyncJobExecutor(JobExecutor):
+    """
+    Executes functions directly on the event loop thread.
+
+    If the function returns a coroutine object (or another kind of awaitable), that is
+    awaited on and its return value is used as the job's return value.
+    """
+
+    async def run_job(self, func: Callable[..., Any], job: Job) -> Any:
+        retval = func(*job.args, **job.kwargs)
+        if isawaitable(retval):
+            retval = await retval
+
+        return retval
+
+
+
+================================================
+FILE: src/apscheduler/executors/qt.py
+================================================
+from __future__ import annotations
+
+import sys
+from collections.abc import Callable
+from concurrent.futures import Future
+from contextlib import AsyncExitStack
+from typing import Any, TypeVar
+
+import anyio
+import attrs
+from anyio.from_thread import BlockingPortal
+
+from apscheduler import Job, current_job
+from apscheduler.abc import JobExecutor
+
+if "PySide6" in sys.modules:
+    from PySide6.QtCore import QObject, Signal
+elif "PyQt6" in sys.modules:
+    from PyQt6.QtCore import QObject
+    from PyQt6.QtCore import pyqtSignal as Signal
+else:
+    try:
+        from PySide6.QtCore import QObject, Signal
+    except ImportError:
+        from PyQt6.QtCore import QObject
+        from PyQt6.QtCore import pyqtSignal as Signal
+
+T_Retval = TypeVar("T_Retval")
+
+
+class _SchedulerSignals(QObject):
+    run_job = Signal(tuple)
+
+
+@attrs.define(eq=False)
+class QtJobExecutor(JobExecutor):
+    _signals: _SchedulerSignals = attrs.field(init=False, factory=_SchedulerSignals)
+    _portal: BlockingPortal = attrs.field(init=False)
+
+    def __attrs_post_init__(self):
+        self._signals.run_job.connect(self.run_in_qt_thread)
+
+    async def start(self, exit_stack: AsyncExitStack) -> None:
+        self._portal = await exit_stack.enter_async_context(BlockingPortal())
+
+    async def run_job(self, func: Callable[..., T_Retval], job: Job) -> Any:
+        future: Future[T_Retval] = Future()
+        event = anyio.Event()
+        self._signals.run_job.emit((func, job, future, event))
+        await event.wait()
+        return future.result(0)
+
+    def run_in_qt_thread(
+        self,
+        parameters: tuple[Callable[..., T_Retval], Job, Future[T_Retval], anyio.Event],
+    ) -> Any:
+        func, job, future, event = parameters
+        token = current_job.set(job)
+        try:
+            retval = func(*job.args, **job.kwargs)
+        except BaseException as exc:
+            future.set_exception(exc)
+            if not isinstance(exc, Exception):
+                raise
+        else:
+            future.set_result(retval)
+        finally:
+            current_job.reset(token)
+            self._portal.call(event.set)
+
+
+
+================================================
+FILE: src/apscheduler/executors/subprocess.py
+================================================
+from __future__ import annotations
+
+from collections.abc import Callable
+from contextlib import AsyncExitStack
+from functools import partial
+from typing import Any
+
+import attrs
+from anyio import CapacityLimiter, to_process
+
+from .._structures import Job
+from ..abc import JobExecutor
+
+
+@attrs.define(eq=False, kw_only=True)
+class ProcessPoolJobExecutor(JobExecutor):
+    """
+    Executes functions in a process pool.
+
+    :param max_workers: the maximum number of worker processes to keep
+    """
+
+    max_workers: int = 40
+    _limiter: CapacityLimiter = attrs.field(init=False)
+
+    async def start(self, exit_stack: AsyncExitStack) -> None:
+        self._limiter = CapacityLimiter(self.max_workers)
+
+    async def run_job(self, func: Callable[..., Any], job: Job) -> Any:
+        wrapped = partial(func, *job.args, **job.kwargs)
+        return await to_process.run_sync(
+            wrapped, cancellable=True, limiter=self._limiter
+        )
+
+
+
+================================================
+FILE: src/apscheduler/executors/thread.py
+================================================
+from __future__ import annotations
+
+from collections.abc import Callable
+from contextlib import AsyncExitStack
+from functools import partial
+from typing import Any
+
+import attrs
+from anyio import CapacityLimiter, to_thread
+
+from .._structures import Job
+from ..abc import JobExecutor
+
+
+@attrs.define(eq=False, kw_only=True)
+class ThreadPoolJobExecutor(JobExecutor):
+    """
+    Executes functions in a thread pool.
+
+    :param max_workers: the maximum number of worker threads to keep
+    """
+
+    max_workers: int = 40
+    _limiter: CapacityLimiter = attrs.field(init=False)
+
+    async def start(self, exit_stack: AsyncExitStack) -> None:
+        self._limiter = CapacityLimiter(self.max_workers)
+
+    async def run_job(self, func: Callable[..., Any], job: Job) -> Any:
+        wrapped = partial(func, *job.args, **job.kwargs)
+        return await to_thread.run_sync(wrapped, limiter=self._limiter)
+
+

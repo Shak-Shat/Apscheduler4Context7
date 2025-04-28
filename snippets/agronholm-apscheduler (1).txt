@@ -1,0 +1,725 @@
+Directory structure:
+└── cron/
+    ├── __init__.py
+    ├── expressions.py
+    └── fields.py
+
+================================================
+FILE: src/apscheduler/triggers/cron/__init__.py
+================================================
+from __future__ import annotations
+
+from collections.abc import Sequence
+from datetime import datetime, tzinfo
+from typing import Any, ClassVar
+
+import attrs
+from attr.validators import instance_of, optional
+from tzlocal import get_localzone
+
+from ..._converters import as_aware_datetime, as_timezone
+from ..._utils import require_state_version, timezone_repr
+from ...abc import Trigger
+from .fields import (
+    DEFAULT_VALUES,
+    BaseField,
+    DayOfMonthField,
+    DayOfWeekField,
+    MonthField,
+    WeekField,
+)
+
+
+@attrs.define(kw_only=True)
+class CronTrigger(Trigger):
+    """
+    Triggers when current time matches all specified time constraints, similarly to how
+    the UNIX cron scheduler works.
+
+    :param year: 4-digit year
+    :param month: month (1-12)
+    :param day: day of the (1-31)
+    :param week: ISO week (1-53)
+    :param day_of_week: number or name of weekday (0-7 or sun,mon,tue,wed,thu,fri,sat,
+        sun)
+    :param hour: hour (0-23)
+    :param minute: minute (0-59)
+    :param second: second (0-59)
+    :param start_time: earliest possible date/time to trigger on (defaults to current
+        time)
+    :param end_time: latest possible date/time to trigger on
+    :param timezone: time zone to use for the date/time calculations
+        (defaults to the local timezone)
+
+    .. note:: The first weekday is always **monday**.
+    """
+
+    FIELDS_MAP: ClassVar[list[tuple[str, type[BaseField]]]] = [
+        ("year", BaseField),
+        ("month", MonthField),
+        ("day", DayOfMonthField),
+        ("week", WeekField),
+        ("day_of_week", DayOfWeekField),
+        ("hour", BaseField),
+        ("minute", BaseField),
+        ("second", BaseField),
+    ]
+
+    year: int | str | None = None
+    month: int | str | None = None
+    day: int | str | None = None
+    week: int | str | None = None
+    day_of_week: int | str | None = None
+    hour: int | str | None = None
+    minute: int | str | None = None
+    second: int | str | None = None
+    start_time: datetime = attrs.field(
+        converter=as_aware_datetime,
+        validator=instance_of(datetime),
+        factory=datetime.now,
+    )
+    end_time: datetime | None = attrs.field(
+        converter=as_aware_datetime,
+        validator=optional(instance_of(datetime)),
+        default=None,
+    )
+    timezone: tzinfo = attrs.field(
+        converter=as_timezone, validator=instance_of(tzinfo), factory=get_localzone
+    )
+    _fields: list[BaseField] = attrs.field(init=False, eq=False, factory=list)
+    _last_fire_time: datetime | None = attrs.field(
+        converter=as_aware_datetime, init=False, eq=False, default=None
+    )
+
+    def __attrs_post_init__(self) -> None:
+        self._set_fields(
+            [
+                self.year,
+                self.month,
+                self.day,
+                self.week,
+                self.day_of_week,
+                self.hour,
+                self.minute,
+                self.second,
+            ]
+        )
+
+    def _set_fields(self, values: Sequence[int | str | None]) -> None:
+        self._fields = []
+        assigned_values = {
+            field_name: value
+            for (field_name, _), value in zip(self.FIELDS_MAP, values)
+            if value is not None
+        }
+        for field_name, field_class in self.FIELDS_MAP:
+            exprs = assigned_values.pop(field_name, None)
+            if exprs is None:
+                exprs = "*" if assigned_values else DEFAULT_VALUES[field_name]
+
+            field = field_class(field_name, exprs)
+            self._fields.append(field)
+
+    @classmethod
+    def from_crontab(
+        cls,
+        expr: str,
+        *,
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        timezone: tzinfo | str = "local",
+    ) -> CronTrigger:
+        """
+        Create a :class:`~CronTrigger` from a standard crontab expression.
+
+        See https://en.wikipedia.org/wiki/Cron for more information on the format
+        accepted here.
+
+        :param expr: minute, hour, day of month, month, day of week
+        :param start_time: earliest possible date/time to trigger on (defaults to current
+            time)
+        :param end_time: latest possible date/time to trigger on
+        :param timezone: time zone to use for the date/time calculations
+            (defaults to local timezone if omitted)
+
+        """
+        values = expr.split()
+        if len(values) != 5:
+            raise ValueError(f"Wrong number of fields; got {len(values)}, expected 5")
+
+        return cls(
+            minute=values[0],
+            hour=values[1],
+            day=values[2],
+            month=values[3],
+            day_of_week=values[4],
+            start_time=start_time or datetime.now(),
+            end_time=end_time,
+            timezone=timezone,
+        )
+
+    def _increment_field_value(
+        self, dateval: datetime, fieldnum: int
+    ) -> tuple[datetime, int]:
+        """
+        Increments the designated field and resets all less significant fields to their
+        minimum values.
+
+        :return: a tuple containing the new date, and the number of the field that was
+            actually incremented
+        """
+
+        values = {}
+        i = 0
+        while i < len(self._fields):
+            field = self._fields[i]
+            if not field.real:
+                if i == fieldnum:
+                    fieldnum -= 1
+                    i -= 1
+                else:
+                    i += 1
+                continue
+
+            if i < fieldnum:
+                values[field.name] = field.get_value(dateval)
+                i += 1
+            elif i > fieldnum:
+                values[field.name] = field.get_min(dateval)
+                i += 1
+            else:
+                value = field.get_value(dateval)
+                maxval = field.get_max(dateval)
+                if value == maxval:
+                    fieldnum -= 1
+                    i -= 1
+                else:
+                    values[field.name] = value + 1
+                    i += 1
+
+        difference = datetime(**values) - dateval.replace(tzinfo=None)
+        dateval = datetime.fromtimestamp(
+            dateval.timestamp() + difference.total_seconds(), self.timezone
+        )
+        return dateval, fieldnum
+
+    def _set_field_value(
+        self, dateval: datetime, fieldnum: int, new_value: int
+    ) -> datetime:
+        values = {}
+        for i, field in enumerate(self._fields):
+            if field.real:
+                if i < fieldnum:
+                    values[field.name] = field.get_value(dateval)
+                elif i > fieldnum:
+                    values[field.name] = field.get_min(dateval)
+                else:
+                    values[field.name] = new_value
+
+        return datetime(**values, tzinfo=self.timezone, fold=dateval.fold)
+
+    def next(self) -> datetime | None:
+        if self._last_fire_time:
+            next_time = datetime.fromtimestamp(
+                self._last_fire_time.timestamp() + 1, self.timezone
+            )
+        else:
+            next_time = self.start_time
+
+        fieldnum = 0
+        while 0 <= fieldnum < len(self._fields):
+            field = self._fields[fieldnum]
+            curr_value = field.get_value(next_time)
+            next_value = field.get_next_value(next_time)
+
+            if next_value is None:
+                # No valid value was found
+                next_time, fieldnum = self._increment_field_value(
+                    next_time, fieldnum - 1
+                )
+            elif next_value > curr_value:
+                # A valid, but higher than the starting value, was found
+                if field.real:
+                    next_time = self._set_field_value(next_time, fieldnum, next_value)
+                    fieldnum += 1
+                else:
+                    next_time, fieldnum = self._increment_field_value(
+                        next_time, fieldnum
+                    )
+            else:
+                # A valid value was found, no changes necessary
+                fieldnum += 1
+
+            # Return if the date has rolled past the end date
+            if self.end_time and next_time > self.end_time:
+                return None
+
+        if fieldnum >= 0:
+            self._last_fire_time = next_time
+            return next_time
+
+        return None
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "timezone": self.timezone,
+            "fields": [str(f) for f in self._fields],
+            "start_time": self.start_time,
+            "end_time": self.end_time,
+            "last_fire_time": self._last_fire_time,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        require_state_version(self, state, 1)
+        self.timezone = state["timezone"]
+        self.start_time = state["start_time"]
+        self.end_time = state["end_time"]
+        self._last_fire_time = state["last_fire_time"]
+        self._set_fields(state["fields"])
+
+    def __repr__(self) -> str:
+        fields = [f"{field.name}={str(field)!r}" for field in self._fields]
+        fields.append(f"start_time={self.start_time.isoformat()!r}")
+        if self.end_time:
+            fields.append(f"end_time={self.end_time.isoformat()!r}")
+
+        fields.append(f"timezone={timezone_repr(self.timezone)!r}")
+        return f"CronTrigger({', '.join(fields)})"
+
+
+
+================================================
+FILE: src/apscheduler/triggers/cron/expressions.py
+================================================
+"""This module contains the expressions applicable for CronTrigger's fields."""
+
+from __future__ import annotations
+
+import re
+from calendar import monthrange
+from datetime import datetime
+from re import Pattern
+from typing import TYPE_CHECKING, ClassVar
+
+import attrs
+from attr.validators import instance_of, optional
+
+from ..._converters import as_int
+from ..._validators import non_negative_number, positive_number
+
+if TYPE_CHECKING:
+    from .fields import BaseField
+
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+MONTHS = [
+    "jan",
+    "feb",
+    "mar",
+    "apr",
+    "may",
+    "jun",
+    "jul",
+    "aug",
+    "sep",
+    "oct",
+    "nov",
+    "dec",
+]
+
+
+def get_weekday_index(weekday: str) -> int:
+    try:
+        return WEEKDAYS.index(weekday.lower())
+    except ValueError:
+        raise ValueError(f"Invalid weekday name {weekday!r}") from None
+
+
+@attrs.define(slots=True)
+class AllExpression:
+    value_re: ClassVar[Pattern] = re.compile(r"\*(?:/(?P<step>\d+))?$")
+
+    step: int | None = attrs.field(
+        converter=as_int,
+        validator=optional([instance_of(int), positive_number]),
+        default=None,
+    )
+
+    def validate_range(self, field_name: str, min_value: int, max_value: int) -> None:
+        value_range = max_value - min_value
+        if self.step and self.step > value_range:
+            raise ValueError(
+                f"the step value ({self.step}) is higher than the total range of the "
+                f"expression ({value_range})"
+            )
+
+    def get_next_value(self, dateval: datetime, field: BaseField) -> int | None:
+        start = field.get_value(dateval)
+        minval = field.get_min(dateval)
+        maxval = field.get_max(dateval)
+        start = max(start, minval)
+
+        if not self.step:
+            nextval = start
+        else:
+            distance_to_next = (self.step - (start - minval)) % self.step
+            nextval = start + distance_to_next
+
+        return nextval if nextval <= maxval else None
+
+    def __str__(self) -> str:
+        return f"*/{self.step}" if self.step else "*"
+
+
+@attrs.define(kw_only=True)
+class RangeExpression(AllExpression):
+    value_re: ClassVar[Pattern] = re.compile(
+        r"(?P<first>\d+)(?:-(?P<last>\d+))?(?:/(?P<step>\d+))?$"
+    )
+
+    first: int = attrs.field(
+        converter=as_int, validator=[instance_of(int), non_negative_number]
+    )
+    last: int | None = attrs.field(
+        converter=as_int,
+        validator=optional([instance_of(int), non_negative_number]),
+        default=None,
+    )
+
+    def __attrs_post_init__(self) -> None:
+        if self.last is None and self.step is None:
+            self.last = self.first
+
+        if self.last is not None and self.first > self.last:
+            raise ValueError(
+                "The minimum value in a range must not be higher than the maximum"
+            )
+
+    def validate_range(self, field_name: str, min_value: int, max_value: int) -> None:
+        super().validate_range(field_name, min_value, max_value)
+        if self.first < min_value:
+            raise ValueError(
+                f"the first value ({self.first}) is lower than the minimum value "
+                f"({min_value})"
+            )
+        if self.last is not None and self.last > max_value:
+            raise ValueError(
+                f"the last value ({self.last}) is higher than the maximum value "
+                f"({max_value})"
+            )
+        value_range = (self.last or max_value) - self.first
+        if self.step and self.step > value_range:
+            raise ValueError(
+                f"the step value ({self.step}) is higher than the total range of the "
+                f"expression ({value_range})"
+            )
+
+    def get_next_value(self, dateval: datetime, field: BaseField) -> int | None:
+        startval = field.get_value(dateval)
+        minval = field.get_min(dateval)
+        maxval = field.get_max(dateval)
+
+        # Apply range limits
+        minval = max(minval, self.first)
+        maxval = min(maxval, self.last) if self.last is not None else maxval
+        nextval = max(minval, startval)
+
+        # Apply the step if defined
+        if self.step:
+            distance_to_next = (self.step - (nextval - minval)) % self.step
+            nextval += distance_to_next
+
+        return nextval if nextval <= maxval else None
+
+    def __str__(self) -> str:
+        if self.last != self.first and self.last is not None:
+            rangeval = f"{self.first}-{self.last}"
+        else:
+            rangeval = str(self.first)
+
+        if self.step:
+            return f"{rangeval}/{self.step}"
+
+        return rangeval
+
+
+class MonthRangeExpression(RangeExpression):
+    value_re: ClassVar[Pattern] = re.compile(
+        r"(?P<first>[a-z]+)(?:-(?P<last>[a-z]+))?", re.IGNORECASE
+    )
+
+    def __init__(self, first: str, last: str | None = None):
+        try:
+            first_num = MONTHS.index(first.lower()) + 1
+        except ValueError:
+            raise ValueError(f"Invalid month name {first!r}") from None
+
+        if last:
+            try:
+                last_num = MONTHS.index(last.lower()) + 1
+            except ValueError:
+                raise ValueError(f"Invalid month name {last!r}") from None
+        else:
+            last_num = None
+
+        super().__init__(first=first_num, last=last_num)
+
+    def __str__(self) -> str:
+        if self.last != self.first and self.last is not None:
+            return f"{MONTHS[self.first - 1]}-{MONTHS[self.last - 1]}"
+
+        return MONTHS[self.first - 1]
+
+
+@attrs.define(kw_only=True, init=False)
+class WeekdayRangeExpression(RangeExpression):
+    value_re: ClassVar[Pattern] = re.compile(
+        r"(?P<first>[a-z]+)(?:-(?P<last>[a-z]+))?", re.IGNORECASE
+    )
+
+    def __init__(self, first: str, last: str | None = None):
+        first_num = get_weekday_index(first)
+        last_num = get_weekday_index(last) if last else None
+        self.__attrs_init__(first=first_num, last=last_num)
+
+    def __str__(self) -> str:
+        if self.last != self.first and self.last is not None:
+            return f"{WEEKDAYS[self.first]}-{WEEKDAYS[self.last]}"
+
+        return WEEKDAYS[self.first]
+
+
+@attrs.define(kw_only=True, init=False)
+class WeekdayPositionExpression(AllExpression):
+    options: ClassVar[tuple[str, ...]] = ("1st", "2nd", "3rd", "4th", "5th", "last")
+    value_re: ClassVar[Pattern] = re.compile(
+        f"(?P<option_name>{'|'.join(options)}) +(?P<weekday_name>(?:\\d+|\\w+))",
+        re.IGNORECASE,
+    )
+
+    option_num: int
+    weekday: int
+
+    def __init__(self, *, option_name: str, weekday_name: str):
+        option_num = self.options.index(option_name.lower())
+        try:
+            weekday = WEEKDAYS.index(weekday_name.lower())
+        except ValueError:
+            raise ValueError(f"Invalid weekday name {weekday_name!r}") from None
+
+        self.__attrs_init__(option_num=option_num, weekday=weekday)
+
+    def get_next_value(self, dateval: datetime, field: BaseField) -> int | None:
+        # Figure out the weekday of the month's first day and the number of days in that
+        # month
+        first_day_wday, last_day = monthrange(dateval.year, dateval.month)
+
+        # Calculate which day of the month is the first of the target weekdays
+        first_hit_day = self.weekday - first_day_wday + 1
+        if first_hit_day <= 0:
+            first_hit_day += 7
+
+        # Calculate what day of the month the target weekday would be
+        if self.option_num < 5:
+            target_day = first_hit_day + self.option_num * 7
+        else:
+            target_day = first_hit_day + ((last_day - first_hit_day) // 7) * 7
+
+        if last_day >= target_day >= dateval.day:
+            return target_day
+        else:
+            return None
+
+    def __str__(self) -> str:
+        return f"{self.options[self.option_num]} {WEEKDAYS[self.weekday]}"
+
+
+class LastDayOfMonthExpression(AllExpression):
+    value_re: ClassVar[Pattern] = re.compile(r"last", re.IGNORECASE)
+
+    def __init__(self) -> None:
+        super().__init__(None)
+
+    def get_next_value(self, dateval: datetime, field: BaseField) -> int | None:
+        return monthrange(dateval.year, dateval.month)[1]
+
+    def __str__(self) -> str:
+        return "last"
+
+
+
+================================================
+FILE: src/apscheduler/triggers/cron/fields.py
+================================================
+"""
+Fields represent CronTrigger options which map to :class:`~datetime.datetime` fields.
+"""
+
+from __future__ import annotations
+
+import re
+from calendar import monthrange
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from typing import Any, ClassVar
+
+from .expressions import (
+    WEEKDAYS,
+    AllExpression,
+    LastDayOfMonthExpression,
+    MonthRangeExpression,
+    RangeExpression,
+    WeekdayPositionExpression,
+    WeekdayRangeExpression,
+    get_weekday_index,
+)
+
+MIN_VALUES = {
+    "year": 1970,
+    "month": 1,
+    "day": 1,
+    "week": 1,
+    "day_of_week": 0,
+    "hour": 0,
+    "minute": 0,
+    "second": 0,
+}
+MAX_VALUES = {
+    "year": 9999,
+    "month": 12,
+    "day": 31,
+    "week": 53,
+    "day_of_week": 7,
+    "hour": 23,
+    "minute": 59,
+    "second": 59,
+}
+DEFAULT_VALUES: Mapping[str, str | int] = {
+    "year": "*",
+    "month": 1,
+    "day": 1,
+    "week": "*",
+    "day_of_week": "*",
+    "hour": 0,
+    "minute": 0,
+    "second": 0,
+}
+SEPARATOR = re.compile(" *, *")
+
+
+class BaseField:
+    __slots__ = "expressions", "name"
+
+    real: ClassVar[bool] = True
+    compilers: ClassVar[Any] = (AllExpression, RangeExpression)
+
+    def __init_subclass__(cls, real: bool = True, extra_compilers: Sequence = ()):
+        cls.real = real
+        if extra_compilers:
+            cls.compilers += extra_compilers
+
+    def __init__(self, name: str, exprs: int | str):
+        self.name = name
+        self.expressions: list = []
+        for expr in SEPARATOR.split(str(exprs).strip()):
+            self.append_expression(expr)
+
+    def get_min(self, dateval: datetime) -> int:
+        return MIN_VALUES[self.name]
+
+    def get_max(self, dateval: datetime) -> int:
+        return MAX_VALUES[self.name]
+
+    def get_value(self, dateval: datetime) -> int:
+        return getattr(dateval, self.name)
+
+    def get_next_value(self, dateval: datetime) -> int | None:
+        smallest = None
+        for expr in self.expressions:
+            value = expr.get_next_value(dateval, self)
+            if smallest is None or (value is not None and value < smallest):
+                smallest = value
+
+        return smallest
+
+    def append_expression(self, expr: str) -> None:
+        for compiler in self.compilers:
+            match = compiler.value_re.match(expr)
+            if match:
+                compiled_expr = compiler(**match.groupdict())
+
+                try:
+                    compiled_expr.validate_range(
+                        self.name, MIN_VALUES[self.name], MAX_VALUES[self.name]
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Error validating expression {expr!r}: {exc}"
+                    ) from exc
+
+                self.expressions.append(compiled_expr)
+                return
+
+        raise ValueError(f"Unrecognized expression {expr!r} for field {self.name!r}")
+
+    def __str__(self) -> str:
+        expr_strings = (str(e) for e in self.expressions)
+        return ",".join(expr_strings)
+
+
+class WeekField(BaseField, real=False):
+    __slots__ = ()
+
+    def get_value(self, dateval: datetime) -> int:
+        return dateval.isocalendar()[1]
+
+
+class DayOfMonthField(
+    BaseField, extra_compilers=(WeekdayPositionExpression, LastDayOfMonthExpression)
+):
+    __slots__ = ()
+
+    def get_max(self, dateval: datetime) -> int:
+        return monthrange(dateval.year, dateval.month)[1]
+
+
+class DayOfWeekField(BaseField, real=False, extra_compilers=(WeekdayRangeExpression,)):
+    __slots__ = ()
+
+    def append_expression(self, expr: str) -> None:
+        # Convert numeric weekday expressions into textual ones
+        match = RangeExpression.value_re.match(expr)
+        if match:
+            groups = match.groups()
+            first = int(groups[0]) - 1
+            first = 6 if first < 0 else first
+            if groups[1]:
+                last = int(groups[1]) - 1
+                last = 6 if last < 0 else last
+            else:
+                last = first
+
+            expr = f"{WEEKDAYS[first]}-{WEEKDAYS[last]}"
+
+        # For expressions like Sun-Tue or Sat-Mon, add two expressions that together
+        # cover the expected weekdays
+        match = WeekdayRangeExpression.value_re.match(expr)
+        if match and match.groups()[1]:
+            groups = match.groups()
+            first_index = get_weekday_index(groups[0])
+            last_index = get_weekday_index(groups[1])
+            if first_index > last_index:
+                super().append_expression(f"{WEEKDAYS[0]}-{groups[1]}")
+                super().append_expression(f"{groups[0]}-{WEEKDAYS[-1]}")
+                return
+
+        super().append_expression(expr)
+
+    def get_value(self, dateval: datetime) -> int:
+        return dateval.weekday()
+
+
+class MonthField(BaseField, extra_compilers=(MonthRangeExpression,)):
+    __slots__ = ()
+
+

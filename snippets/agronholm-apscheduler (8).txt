@@ -1,0 +1,216 @@
+Directory structure:
+└── serializers/
+    ├── __init__.py
+    ├── cbor.py
+    ├── json.py
+    └── pickle.py
+
+================================================
+FILE: src/apscheduler/serializers/__init__.py
+================================================
+
+
+
+================================================
+FILE: src/apscheduler/serializers/cbor.py
+================================================
+from __future__ import annotations
+
+from datetime import date, timedelta, tzinfo
+from enum import Enum
+from typing import Any
+
+import attrs
+from cbor2 import CBORDecoder, CBOREncoder, CBOREncodeTypeError, CBORTag, dumps, loads
+
+from .. import DeserializationError, SerializationError
+from .._marshalling import marshal_object, marshal_timezone, unmarshal_object
+from ..abc import Serializer
+
+
+@attrs.define(kw_only=True, eq=False)
+class CBORSerializer(Serializer):
+    """
+    Serializes objects using CBOR (:rfc:`8949`).
+
+    Can serialize types not normally CBOR serializable, if they implement
+    ``__getstate__()`` and ``__setstate__()``.
+
+    :param type_tag: CBOR tag number for indicating arbitrary serialized object
+    :param dump_options: keyword arguments passed to :func:`cbor2.dumps`
+    :param load_options: keyword arguments passed to :func:`cbor2.loads`
+    """
+
+    type_tag: int = 4664
+    dump_options: dict[str, Any] = attrs.field(factory=dict)
+    load_options: dict[str, Any] = attrs.field(factory=dict)
+
+    def __attrs_post_init__(self) -> None:
+        self.dump_options.setdefault("default", self._default_hook)
+        self.load_options.setdefault("tag_hook", self._tag_hook)
+
+    def _default_hook(self, encoder: CBOREncoder, value: object) -> None:
+        if isinstance(value, date):
+            encoder.encode(value.isoformat())
+        elif isinstance(value, timedelta):
+            encoder.encode(value.total_seconds())
+        elif isinstance(value, tzinfo):
+            encoder.encode(marshal_timezone(value))
+        elif isinstance(value, Enum):
+            encoder.encode(value.name)
+        elif hasattr(value, "__getstate__"):
+            marshalled = marshal_object(value)
+            encoder.encode(CBORTag(self.type_tag, marshalled))
+        else:
+            raise CBOREncodeTypeError(
+                f"cannot serialize type {value.__class__.__name__}"
+            )
+
+    def _tag_hook(
+        self, decoder: CBORDecoder, tag: CBORTag, shareable_index: int | None = None
+    ) -> object:
+        if tag.tag == self.type_tag:
+            cls_ref, state = tag.value
+            return unmarshal_object(cls_ref, state)
+
+    def serialize(self, obj: object) -> bytes:
+        try:
+            return dumps(obj, **self.dump_options)
+        except Exception as exc:
+            raise SerializationError from exc
+
+    def deserialize(self, serialized: bytes):
+        try:
+            return loads(serialized, **self.load_options)
+        except Exception as exc:
+            raise DeserializationError from exc
+
+
+
+================================================
+FILE: src/apscheduler/serializers/json.py
+================================================
+from __future__ import annotations
+
+from datetime import date, timedelta, tzinfo
+from enum import Enum
+from json import dumps, loads
+from typing import Any
+from uuid import UUID
+
+import attrs
+
+from .. import DeserializationError, SerializationError
+from .._marshalling import (
+    marshal_object,
+    marshal_timezone,
+    unmarshal_object,
+)
+from ..abc import Serializer
+
+
+@attrs.define(kw_only=True, eq=False)
+class JSONSerializer(Serializer):
+    """
+    Serializes objects using JSON.
+
+    Can serialize types not normally CBOR serializable, if they implement
+    ``__getstate__()`` and ``__setstate__()``. These objects are serialized into dicts
+    that contain the necessary information for deserialization in ``magic_key``.
+
+    :param magic_key: name of a specially handled dict key that indicates that a dict
+        contains a serialized instance of an arbitrary type
+    :param dump_options: keyword arguments passed to :func:`json.dumps`
+    :param load_options: keyword arguments passed to :func:`json.loads`
+    """
+
+    magic_key: str = "_apscheduler_json"
+    dump_options: dict[str, Any] = attrs.field(factory=dict)
+    load_options: dict[str, Any] = attrs.field(factory=dict)
+
+    def __attrs_post_init__(self):
+        self.dump_options["default"] = self._default_hook
+        self.load_options["object_hook"] = self._object_hook
+
+    def _default_hook(self, obj):
+        if isinstance(obj, date):
+            return obj.isoformat()
+        elif isinstance(obj, timedelta):
+            return obj.total_seconds()
+        elif isinstance(obj, tzinfo):
+            return marshal_timezone(obj)
+        elif isinstance(obj, UUID):
+            return str(obj)
+        elif isinstance(obj, Enum):
+            return obj.name
+        elif hasattr(obj, "__getstate__"):
+            cls_ref, state = marshal_object(obj)
+            return {self.magic_key: [cls_ref, state]}
+
+        raise TypeError(
+            f"Object of type {obj.__class__.__name__!r} is not JSON serializable"
+        )
+
+    def _object_hook(self, obj_state: dict[str, Any]):
+        if self.magic_key in obj_state:
+            ref, state = obj_state[self.magic_key]
+            return unmarshal_object(ref, state)
+
+        return obj_state
+
+    def serialize(self, obj: object) -> bytes:
+        try:
+            return dumps(obj, ensure_ascii=False, **self.dump_options).encode("utf-8")
+        except Exception as exc:
+            raise SerializationError from exc
+
+    def deserialize(self, serialized: bytes):
+        try:
+            return loads(serialized, **self.load_options)
+        except Exception as exc:
+            raise DeserializationError from exc
+
+
+
+================================================
+FILE: src/apscheduler/serializers/pickle.py
+================================================
+from __future__ import annotations
+
+from pickle import dumps, loads
+
+import attrs
+
+from .. import DeserializationError, SerializationError
+from ..abc import Serializer
+
+
+@attrs.define(kw_only=True, eq=False)
+class PickleSerializer(Serializer):
+    """
+    Uses the :mod:`pickle` module to (de)serialize objects.
+
+    As this serialization method is native to Python, it is able to serialize a wide
+    range of types, at the expense of being insecure. Do **not** use this serializer
+    unless you can fully trust the entire system to not have maliciously injected data.
+    Such data can be made to call arbitrary functions with arbitrary arguments on
+    unpickling.
+
+    :param protocol: the pickle protocol number to use
+    """
+
+    protocol: int = 4
+
+    def serialize(self, obj: object) -> bytes:
+        try:
+            return dumps(obj, self.protocol)
+        except Exception as exc:
+            raise SerializationError from exc
+
+    def deserialize(self, serialized: bytes):
+        try:
+            return loads(serialized)
+        except Exception as exc:
+            raise DeserializationError from exc
+
+
